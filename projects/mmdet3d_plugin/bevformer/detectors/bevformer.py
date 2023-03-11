@@ -53,11 +53,11 @@ class BEVFormer(MVXTwoStageDetector):
                              train_cfg, test_cfg, pretrained)
         self.grid_mask = GridMask(
             True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
-        self.use_grid_mask = use_grid_mask
+        self.use_grid_mask = use_grid_mask # True
         self.fp16_enabled = False
 
         # temporal
-        self.video_test_mode = video_test_mode
+        self.video_test_mode = video_test_mode # True
         self.prev_frame_info = {
             'prev_bev': None,
             'scene_token': None,
@@ -67,9 +67,8 @@ class BEVFormer(MVXTwoStageDetector):
 
     def extract_img_feat(self, img, img_metas, len_queue=None):
         """Extract features of images."""
-        B = img.size(0)
+        B = img.size(0) # 2
         if img is not None:
-            
             # input_shape = img.shape[-2:]
             # # update real input shape of each single img
             # for img_meta in img_metas:
@@ -78,33 +77,34 @@ class BEVFormer(MVXTwoStageDetector):
             if img.dim() == 5 and img.size(0) == 1:
                 img.squeeze_()
             elif img.dim() == 5 and img.size(0) > 1:
-                B, N, C, H, W = img.size()
-                img = img.reshape(B * N, C, H, W)
+                B, N, C, H, W = img.size() # 2, 6, 3, 736, 1280
+                img = img.reshape(B * N, C, H, W) # (12, 3, 736, 1280)
             if self.use_grid_mask:
                 img = self.grid_mask(img)
 
-            img_feats = self.img_backbone(img)
+            img_feats = self.img_backbone(img) # (12, 2048, 23, 40)
             if isinstance(img_feats, dict):
                 img_feats = list(img_feats.values())
         else:
             return None
         if self.with_img_neck:
-            img_feats = self.img_neck(img_feats)
+            img_feats = self.img_neck(img_feats) # tuple((12, 256, 23, 40))
 
         img_feats_reshaped = []
         for img_feat in img_feats:
-            BN, C, H, W = img_feat.size()
+            BN, C, H, W = img_feat.size() # 12, 256, 23, 40
             if len_queue is not None:
+                # (1, 2, 6, 256, 23, 40)
                 img_feats_reshaped.append(img_feat.view(int(B/len_queue), len_queue, int(BN / B), C, H, W))
             else:
                 img_feats_reshaped.append(img_feat.view(B, int(BN / B), C, H, W))
-        return img_feats_reshaped
+        return img_feats_reshaped # (1, 6, 256, 23, 40)
 
     @auto_fp16(apply_to=('img'))
     def extract_feat(self, img, img_metas=None, len_queue=None):
         """Extract features from images and points."""
-
-        img_feats = self.extract_img_feat(img, img_metas, len_queue=len_queue)
+        # 计算prev_bev时:(1, 2, 6, 256, 23, 40) 或 计算curr时:(1, 6, 256, 23, 40)
+        img_feats = self.extract_img_feat(img, img_metas, len_queue=len_queue) # 抽取图像特征
 
         return img_feats
 
@@ -160,18 +160,19 @@ class BEVFormer(MVXTwoStageDetector):
         """
         self.eval()
         with torch.no_grad():
-            prev_bev = None
-            bs, len_queue, num_cams, C, H, W = imgs_queue.shape
-            imgs_queue = imgs_queue.reshape(bs*len_queue, num_cams, C, H, W)
-            img_feats_list = self.extract_feat(img=imgs_queue, len_queue=len_queue)
+            prev_bev = None # 初始化前一帧的BEV特征图为None
+            bs, len_queue, num_cams, C, H, W = imgs_queue.shape # 1, 2, 6, 3, 736, 1280
+            imgs_queue = imgs_queue.reshape(bs*len_queue, num_cams, C, H, W) # (2, 6, 3, 736, 1280)
+            img_feats_list = self.extract_feat(img=imgs_queue, len_queue=len_queue) # List[(1, 2, 6, 256, 23, 40)]
+            # 逐帧处理
             for i in range(len_queue):
-                img_metas = [each[i] for each in img_metas_list]
+                img_metas = [each[i] for each in img_metas_list] # 提取该帧的img_metas信息
                 # img_feats = self.extract_feat(img=img, img_metas=img_metas)
-                img_feats = [each_scale[:, i] for each_scale in img_feats_list]
+                img_feats = [each_scale[:, i] for each_scale in img_feats_list] # List[(1, 6, 256, 23, 44)]
                 prev_bev = self.pts_bbox_head(
-                    img_feats, img_metas, prev_bev, only_bev=True)
+                    img_feats, img_metas, prev_bev, only_bev=True) # 计算BEV特征图 (1, 22500, 256)
             self.train()
-            return prev_bev
+            return prev_bev # (1, 22500, 256)
 
     @auto_fp16(apply_to=('img', 'prev_bev', 'points'))
     def forward_train(self,
@@ -211,14 +212,14 @@ class BEVFormer(MVXTwoStageDetector):
             dict: Losses of different branches.
         """
 
-        len_queue = img.size(1)
-        prev_img = img[:, :-1, ...]
-        img = img[:, -1, ...]
-        prev_img_metas = copy.deepcopy(img_metas)
-        prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
+        len_queue = img.size(1) # 3
+        prev_img = img[:, :-1, ...] # 前2帧 (1, 2, 6, 3, 736, 1280)
+        img = img[:, -1, ...] # 当前帧 (1, 6, 3, 736, 1280)
+        prev_img_metas = copy.deepcopy(img_metas) # 复制img_metas信息, 3帧的信息
+        prev_bev = self.obtain_history_bev(prev_img, prev_img_metas) # 获取历史帧的BEV特征图 (1, 22500, 256)
 
-        img_metas = [each[len_queue-1] for each in img_metas]
-        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        img_metas = [each[len_queue-1] for each in img_metas] # 只有一帧，取出T帧的img_metas
+        img_feats = self.extract_feat(img=img, img_metas=img_metas) # 计算当前帧的图像特征List[(1, 6, 256, 23, 40)]
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,

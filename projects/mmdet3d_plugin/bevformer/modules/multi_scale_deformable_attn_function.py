@@ -114,18 +114,18 @@ class MultiScaleDeformableAttnFunction_fp32(Function):
             Tensor: has shape (bs, num_queries, embed_dims)
         """
 
-        ctx.im2col_step = im2col_step
+        ctx.im2col_step = im2col_step # 64
         output = ext_module.ms_deform_attn_forward(
-            value,
-            value_spatial_shapes,
-            value_level_start_index,
-            sampling_locations,
-            attention_weights,
-            im2col_step=ctx.im2col_step)
+            value, # (2, 22500, 8, 32) 或 (6, 920, 8, 32)
+            value_spatial_shapes, # (1, 2)-->[[150, 150]]或 [[23, 40]]
+            value_level_start_index, # [0]
+            sampling_locations, # (2, 22500, 8, 1, 4, 2)或(6, 5438, 8, 1, 8, 2)
+            attention_weights, # (2, 22500, 8, 1, 4, 2)或(6, 5438, 8, 1, 8)
+            im2col_step=ctx.im2col_step) 
         ctx.save_for_backward(value, value_spatial_shapes,
                               value_level_start_index, sampling_locations,
                               attention_weights)
-        return output
+        return output # (2, 22500, 256)
 
     @staticmethod
     @once_differentiable

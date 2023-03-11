@@ -167,10 +167,10 @@ def custom_train_detector(model,
             assert isinstance(hook_cfg, dict), \
                 'Each item in custom_hooks expects dict type, but got ' \
                 f'{type(hook_cfg)}'
-            hook_cfg = hook_cfg.copy()
-            priority = hook_cfg.pop('priority', 'NORMAL')
-            hook = build_from_cfg(hook_cfg, HOOKS)
-            runner.register_hook(hook, priority=priority)
+            hook_cfg = hook_cfg.copy() # 赋值自定义hook的配置
+            priority = hook_cfg.pop('priority', 'NORMAL') # 弹出优先级
+            hook = build_from_cfg(hook_cfg, HOOKS) # 构建hook
+            runner.register_hook(hook, priority=priority) # 注册hook
 
     if cfg.resume_from:
         runner.resume(cfg.resume_from)

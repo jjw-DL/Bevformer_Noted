@@ -48,38 +48,38 @@ class PerceptionTransformer(BaseModule):
                  rotate_center=[100, 100],
                  **kwargs):
         super(PerceptionTransformer, self).__init__(**kwargs)
-        self.encoder = build_transformer_layer_sequence(encoder)
-        self.decoder = build_transformer_layer_sequence(decoder)
-        self.embed_dims = embed_dims
-        self.num_feature_levels = num_feature_levels
-        self.num_cams = num_cams
+        self.encoder = build_transformer_layer_sequence(encoder) # BEVFormerLayer
+        self.decoder = build_transformer_layer_sequence(decoder) # DetectionTransformerDecoder
+        self.embed_dims = embed_dims # 256
+        self.num_feature_levels = num_feature_levels # 4
+        self.num_cams = num_cams # 6
         self.fp16_enabled = False
 
-        self.rotate_prev_bev = rotate_prev_bev
-        self.use_shift = use_shift
-        self.use_can_bus = use_can_bus
-        self.can_bus_norm = can_bus_norm
-        self.use_cams_embeds = use_cams_embeds
+        self.rotate_prev_bev = rotate_prev_bev # True
+        self.use_shift = use_shift # True
+        self.use_can_bus = use_can_bus # True
+        self.can_bus_norm = can_bus_norm # True
+        self.use_cams_embeds = use_cams_embeds # True
 
-        self.two_stage_num_proposals = two_stage_num_proposals
+        self.two_stage_num_proposals = two_stage_num_proposals # 300
         self.init_layers()
-        self.rotate_center = rotate_center
+        self.rotate_center = rotate_center # [100, 100]
 
     def init_layers(self):
         """Initialize layers of the Detr3DTransformer."""
         self.level_embeds = nn.Parameter(torch.Tensor(
-            self.num_feature_levels, self.embed_dims))
+            self.num_feature_levels, self.embed_dims)) # (4, 256)
         self.cams_embeds = nn.Parameter(
-            torch.Tensor(self.num_cams, self.embed_dims))
-        self.reference_points = nn.Linear(self.embed_dims, 3)
+            torch.Tensor(self.num_cams, self.embed_dims)) # (6, 256)
+        self.reference_points = nn.Linear(self.embed_dims, 3) # (256, 3)
         self.can_bus_mlp = nn.Sequential(
             nn.Linear(18, self.embed_dims // 2),
             nn.ReLU(inplace=True),
             nn.Linear(self.embed_dims // 2, self.embed_dims),
             nn.ReLU(inplace=True),
-        )
+        ) # 18-->128-->256
         if self.can_bus_norm:
-            self.can_bus_mlp.add_module('norm', nn.LayerNorm(self.embed_dims))
+            self.can_bus_mlp.add_module('norm', nn.LayerNorm(self.embed_dims)) # LN
 
     def init_weights(self):
         """Initialize the transformer weights."""
@@ -112,85 +112,88 @@ class PerceptionTransformer(BaseModule):
         obtain bev features.
         """
 
-        bs = mlvl_feats[0].size(0)
-        bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1)
-        bev_pos = bev_pos.flatten(2).permute(2, 0, 1)
+        bs = mlvl_feats[0].size(0) # 1
+        bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1) # (22500, 256)-->(22500, 1, 256)-->(22500, 1, 256)
+        bev_pos = bev_pos.flatten(2).permute(2, 0, 1) # (1, 256, 150, 150)-->(1, 256, 22500)-->(22500, 1, 256)
 
         # obtain rotation angle and shift with ego motion
-        delta_x = kwargs['img_metas'][0]['can_bus'][0]
-        delta_y = kwargs['img_metas'][0]['can_bus'][1]
-        ego_angle = kwargs['img_metas'][0]['can_bus'][-2] / np.pi * 180
-        rotation_angle = kwargs['img_metas'][0]['can_bus'][-1]
-        grid_length_y = grid_length[0]
-        grid_length_x = grid_length[1]
-        translation_length = np.sqrt(delta_x ** 2 + delta_y ** 2)
-        translation_angle = np.arctan2(delta_y, delta_x) / np.pi * 180
+        delta_x = kwargs['img_metas'][0]['can_bus'][0] # eg:0 相对值 4.067
+        delta_y = kwargs['img_metas'][0]['can_bus'][1] # eg:0 相对值 -2.171
+        ego_angle = kwargs['img_metas'][0]['can_bus'][-2] / np.pi * 180 # eg:332.57 绝对值 332.16
+        rotation_angle = kwargs['img_metas'][0]['can_bus'][-1] # eg:0 相对值 -0.413
+        grid_length_y = grid_length[0] # 0.6826 = 102.4 / 150 表示一个网格代表的实际大小
+        grid_length_x = grid_length[1] # 0.6826
+        translation_length = np.sqrt(delta_x ** 2 + delta_y ** 2) # 计算偏移距离 eg:4.6109
+        translation_angle = np.arctan2(delta_y, delta_x) / np.pi * 180 # 计算转过的偏航角 -28.09
         if translation_angle < 0:
-            translation_angle += 360
-        bev_angle = ego_angle - translation_angle
+            translation_angle += 360 # 331.907
+        bev_angle = ego_angle - translation_angle # BEV下的偏航角 332.16 - 331.907 = 0.2572
         shift_y = translation_length * \
-            np.cos(bev_angle / 180 * np.pi) / grid_length_y / bev_h
+            np.cos(bev_angle / 180 * np.pi) / grid_length_y / bev_h # BEV特征图上的偏移量（实际长度/单位长度/特征图大小）eg:0.045
         shift_x = translation_length * \
-            np.sin(bev_angle / 180 * np.pi) / grid_length_x / bev_w
-        shift_y = shift_y * self.use_shift
+            np.sin(bev_angle / 180 * np.pi) / grid_length_x / bev_w # 0.0002
+        shift_y = shift_y * self.use_shift # 相对于上一帧自车坐标系的偏移量
         shift_x = shift_x * self.use_shift
-        shift = bev_queries.new_tensor([shift_x, shift_y])
+        shift = bev_queries.new_tensor([shift_x, shift_y]) # eg:[0.0002, 0.0450]
         
-
 
         if prev_bev is not None:
             if prev_bev.shape[1] == bev_h * bev_w:
-                prev_bev = prev_bev.permute(1, 0, 2)
+                prev_bev = prev_bev.permute(1, 0, 2) # (1, 22500, 256)-->(22500, 1, 256)
             if self.rotate_prev_bev:
-                num_prev_bev = prev_bev.size(1)
+                num_prev_bev = prev_bev.size(1) # 1
+                # (22500, 1, 256)-->(150, 150, 256)-->(256, 150, 150)
                 prev_bev = prev_bev.reshape(bev_h, bev_w, -1).permute(2, 0, 1)
                 prev_bev = rotate(prev_bev, rotation_angle,
-                                  center=self.rotate_center)
+                                  center=self.rotate_center) # 旋转特征图：(256, 150, 150)
+                # (256, 150, 150)-->(150, 150, 256)-->(22500, 1, 256)
                 prev_bev = prev_bev.permute(1, 2, 0).reshape(
                     bev_h * bev_w, num_prev_bev, -1)
 
         # add can bus signals
         can_bus = bev_queries.new_tensor(kwargs['img_metas'][0]['can_bus'])[
-            None, None, :]
-        can_bus = self.can_bus_mlp(can_bus)
-        bev_queries = bev_queries + can_bus * self.use_can_bus
+            None, None, :] # 获取该帧的can bus信息 (1, 1, 18)
+        can_bus = self.can_bus_mlp(can_bus) # 对can bus进行编码-->(1, 1, 256)
+        bev_queries = bev_queries + can_bus * self.use_can_bus # (22500, 1, 256) 为query增加位置信息
 
         feat_flatten = []
         spatial_shapes = []
         for lvl, feat in enumerate(mlvl_feats):
-            bs, num_cam, c, h, w = feat.shape
-            spatial_shape = (h, w)
-            feat = feat.flatten(3).permute(1, 0, 3, 2)
+            bs, num_cam, c, h, w = feat.shape # (1, 6, 256, 23, 40)
+            spatial_shape = (h, w) # [23, 40]
+            feat = feat.flatten(3).permute(1, 0, 3, 2) # (1, 6, 256, 920)-->(6, 1, 920, 256)
             if self.use_cams_embeds:
-                feat = feat + self.cams_embeds[:, None, None, :].to(feat.dtype)
+                # (6, 1, 920, 256) + (6, 1, 1, 256) --> (6, 1, 920, 256)
+                feat = feat + self.cams_embeds[:, None, None, :].to(feat.dtype) # 在图像特征上融入camera信息
+            # (6, 1, 920, 256) + (1, 1, 1, 256) --> (6, 1, 920, 256)
             feat = feat + self.level_embeds[None,
-                                            None, lvl:lvl + 1, :].to(feat.dtype)
-            spatial_shapes.append(spatial_shape)
-            feat_flatten.append(feat)
+                                            None, lvl:lvl + 1, :].to(feat.dtype) # 增加level信息
+            spatial_shapes.append(spatial_shape) # [23, 40] 添加特征图的空间shape到shape list中
+            feat_flatten.append(feat) # 添加拉直后的特征图到特征list中, 只有一层
 
-        feat_flatten = torch.cat(feat_flatten, 2)
+        feat_flatten = torch.cat(feat_flatten, 2) # 拼接特征图 (6, 1, 920, 256)
         spatial_shapes = torch.as_tensor(
-            spatial_shapes, dtype=torch.long, device=bev_pos.device)
+            spatial_shapes, dtype=torch.long, device=bev_pos.device) # [[23, 40]]
         level_start_index = torch.cat((spatial_shapes.new_zeros(
-            (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+            (1,)), spatial_shapes.prod(1).cumsum(0)[:-1])) # [0]
 
         feat_flatten = feat_flatten.permute(
-            0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)
+            0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims) --> (6, 920, 1, 256)
         bev_embed = self.encoder(
-            bev_queries,
-            feat_flatten,
-            feat_flatten,
-            bev_h=bev_h,
-            bev_w=bev_w,
-            bev_pos=bev_pos,
-            spatial_shapes=spatial_shapes,
-            level_start_index=level_start_index,
-            prev_bev=prev_bev,
-            shift=shift,
+            bev_queries, # (22500, 1, 256)
+            feat_flatten, # (6, 920, 1, 256)
+            feat_flatten, #  (6, 920, 1, 256)
+            bev_h=bev_h, # 150
+            bev_w=bev_w, # 150
+            bev_pos=bev_pos, # (22500, 1, 256)
+            spatial_shapes=spatial_shapes, # [[23, 40]]
+            level_start_index=level_start_index, # [0]
+            prev_bev=prev_bev, # None和[22500, 1, 256]
+            shift=shift, # [0, 0]和[0.0002, 0.0450]
             **kwargs
-        )
+        ) # --> (1, 22500, 256)
 
-        return bev_embed
+        return bev_embed # (1, 22500, 256)
 
     def forward(self,
                 mlvl_feats,
@@ -242,40 +245,47 @@ class PerceptionTransformer(BaseModule):
         """
 
         bev_embed = self.get_bev_features(
-            mlvl_feats,
-            bev_queries,
-            bev_h,
-            bev_w,
-            grid_length=grid_length,
-            bev_pos=bev_pos,
-            prev_bev=prev_bev,
+            mlvl_feats, # List[(1, 6, 256, 23, 40)]
+            bev_queries, # (22500, 256)
+            bev_h, # 150
+            bev_w, # 150
+            grid_length=grid_length, # (0.6826, 0.6826)
+            bev_pos=bev_pos, # (1, 256, 150, 150)
+            prev_bev=prev_bev, # (1, 22500, 256)
             **kwargs) # bev_embed shape: bs, bev_h*bev_w, embed_dims
 
-        bs = mlvl_feats[0].size(0)
-        query_pos, query = torch.split(object_query_embed, self.embed_dims, dim=1)
-        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
-        query = query.unsqueeze(0).expand(bs, -1, -1)
-        reference_points = self.reference_points(query_pos)
-        reference_points = reference_points.sigmoid()
-        init_reference_out = reference_points
+        bs = mlvl_feats[0].size(0) # 1
+        query_pos, query = torch.split(object_query_embed, self.embed_dims, dim=1) # (900, 156)和(900, 156）
+        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1) # (1, 900, 156)
+        query = query.unsqueeze(0).expand(bs, -1, -1) # (1, 900, 156)
+        reference_points = self.reference_points(query_pos) # 256-->3 (1, 900, 3)
+        reference_points = reference_points.sigmoid() # (1, 900, 3)
+        init_reference_out = reference_points # 初始参考点(随机初始化)
 
-        query = query.permute(1, 0, 2)
-        query_pos = query_pos.permute(1, 0, 2)
-        bev_embed = bev_embed.permute(1, 0, 2)
-
+        query = query.permute(1, 0, 2) # (900, 1, 256)
+        query_pos = query_pos.permute(1, 0, 2) # (900, 1, 256)
+        bev_embed = bev_embed.permute(1, 0, 2) # (22500, 1, 256)
+        
+        # (6, 900, 1, 256)和(6, 1, 900, 3)
         inter_states, inter_references = self.decoder(
-            query=query,
-            key=None,
-            value=bev_embed,
-            query_pos=query_pos,
-            reference_points=reference_points,
-            reg_branches=reg_branches,
-            cls_branches=cls_branches,
-            spatial_shapes=torch.tensor([[bev_h, bev_w]], device=query.device),
-            level_start_index=torch.tensor([0], device=query.device),
+            query=query, # (900, 1, 256)
+            key=None, 
+            value=bev_embed, # (22500, 1, 256)
+            query_pos=query_pos, # (900, 1, 256)
+            reference_points=reference_points, # (1, 900, 3)
+            reg_branches=reg_branches, # 6层
+            cls_branches=cls_branches, # None
+            spatial_shapes=torch.tensor([[bev_h, bev_w]], device=query.device), # [[150, 150]]
+            level_start_index=torch.tensor([0], device=query.device), # [0]
             **kwargs)
 
-        inter_references_out = inter_references
+        inter_references_out = inter_references # 内部decoder layer输出的参考点 (6, 1, 900, 3)
 
+        """
+        bev_embed:(22500, 1, 256) bev的拉直嵌入
+        inter_states:(6, 900, 1, 256) 内部decoder layer输出的object query
+        init_reference_out:(1, 900, 3) 随机初始化的参考点（可学习）
+        inter_references_out:(6, 1, 900, 3) 内部decoder layer输出的参考点
+        """
         return bev_embed, inter_states, init_reference_out, inter_references_out
 

@@ -19,14 +19,14 @@ import random
 class CustomNuScenesDataset(NuScenesDataset):
     r"""NuScenes Dataset.
 
-    This datset only add camera intrinsics and extrinsics to the results.
+    This dataset only add camera intrinsics and extrinsics to the results.
     """
 
     def __init__(self, queue_length=4, bev_size=(200, 200), overlap_test=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.queue_length = queue_length
-        self.overlap_test = overlap_test
-        self.bev_size = bev_size
+        self.queue_length = queue_length # 3
+        self.overlap_test = overlap_test # False
+        self.bev_size = bev_size # (150, 150)
 
     def prepare_train_data(self, index):
         """
@@ -39,66 +39,68 @@ class CustomNuScenesDataset(NuScenesDataset):
         data_queue = []
 
         # temporal aug
-        prev_indexs_list = list(range(index-self.queue_length, index))
-        random.shuffle(prev_indexs_list)
-        prev_indexs_list = sorted(prev_indexs_list[1:], reverse=True)
-        ##
+        prev_indexs_list = list(range(index-self.queue_length, index)) # eg:index=19436-->19433,19434,19435
+        random.shuffle(prev_indexs_list) # 将索引打乱
+        prev_indexs_list = sorted(prev_indexs_list[1:], reverse=True) # 将第一帧之后的索引逆序排列(从大到小)
 
-        input_dict = self.get_data_info(index)
+        input_dict = self.get_data_info(index) # 获取当前帧的info
         if input_dict is None:
             return None
-        frame_idx = input_dict['frame_idx']
-        scene_token = input_dict['scene_token']
+        frame_idx = input_dict['frame_idx'] # 帧id eg: 28
+        scene_token = input_dict['scene_token'] # 场景token
         self.pre_pipeline(input_dict)
-        example = self.pipeline(input_dict)
+        example = self.pipeline(input_dict) # 进入data pipeline
         if self.filter_empty_gt and \
                 (example is None or ~(example['gt_labels_3d']._data != -1).any()):
-            return None
-        data_queue.insert(0, example)
-        for i in prev_indexs_list:
+            return None # 如果该帧不存在目标物体则直接返回None
+        data_queue.insert(0, example) # 在数据队列中插入当前帧的info
+        for i in prev_indexs_list: # [19435, 19434]
             i = max(0, i)
-            input_dict = self.get_data_info(i)
+            input_dict = self.get_data_info(i) 
             if input_dict is None:
                 return None
             if input_dict['frame_idx'] < frame_idx and input_dict['scene_token'] == scene_token:
-                self.pre_pipeline(input_dict)
-                example = self.pipeline(input_dict)
+                self.pre_pipeline(input_dict) # 增加预处理字段
+                example = self.pipeline(input_dict) # 进入data pipeline
                 if self.filter_empty_gt and \
                         (example is None or ~(example['gt_labels_3d']._data != -1).any()):
-                    return None
-                frame_idx = input_dict['frame_idx']
-            data_queue.insert(0, copy.deepcopy(example))
+                    return None # 如果该帧不存在目标物体则直接返回None
+                frame_idx = input_dict['frame_idx'] # 获取帧id
+            data_queue.insert(0, copy.deepcopy(example)) # 在数据队列中插入前一帧的info
         return self.union2one(data_queue)
 
     def union2one(self, queue):
         """
         convert sample queue into one single sample.
         """
-        imgs_list = [each['img'].data for each in queue]
-        metas_map = {}
+        imgs_list = [each['img'].data for each in queue] # 从队列中取出图像: List[3 (6, 3, 736, 1280)]
+        metas_map = {} # 初始化metas的dict
         prev_pos = None
         prev_angle = None
+        # 逐帧处理
         for i, each in enumerate(queue):
-            metas_map[i] = each['img_metas'].data
-            if i == 0:
-                metas_map[i]['prev_bev'] = False
-                prev_pos = copy.deepcopy(metas_map[i]['can_bus'][:3])
-                prev_angle = copy.deepcopy(metas_map[i]['can_bus'][-1])
-                metas_map[i]['can_bus'][:3] = 0
-                metas_map[i]['can_bus'][-1] = 0
+            metas_map[i] = each['img_metas'].data # 获取该帧的img_metas
+            if i == 0: # 如果是第一帧
+                metas_map[i]['prev_bev'] = False # 将prev_bev设置为False
+                prev_pos = copy.deepcopy(metas_map[i]['can_bus'][:3]) # 从can bus中获取pos信息
+                prev_angle = copy.deepcopy(metas_map[i]['can_bus'][-1]) # 从can bus中获取yaw角信息 角度单位
+                metas_map[i]['can_bus'][:3] = 0 # 将can bus的pos置0
+                metas_map[i]['can_bus'][-1] = 0 # 将can bus的yaw置0
             else:
-                metas_map[i]['prev_bev'] = True
-                tmp_pos = copy.deepcopy(metas_map[i]['can_bus'][:3])
-                tmp_angle = copy.deepcopy(metas_map[i]['can_bus'][-1])
-                metas_map[i]['can_bus'][:3] -= prev_pos
-                metas_map[i]['can_bus'][-1] -= prev_angle
-                prev_pos = copy.deepcopy(tmp_pos)
+                metas_map[i]['prev_bev'] = True # 将prev_bev设置为True
+                tmp_pos = copy.deepcopy(metas_map[i]['can_bus'][:3]) # 从can bus中获取pos信息
+                tmp_angle = copy.deepcopy(metas_map[i]['can_bus'][-1]) # 从can bus中获取yaw角信息
+                metas_map[i]['can_bus'][:3] -= prev_pos # 计算与前一帧的相对pos
+                metas_map[i]['can_bus'][-1] -= prev_angle # 计算与前一帧的相对yaw
+                prev_pos = copy.deepcopy(tmp_pos) # 更新前一帧的pos和angle
                 prev_angle = copy.deepcopy(tmp_angle)
 
+        # 统一到最后的curr帧上
         queue[-1]['img'] = DC(torch.stack(imgs_list),
-                              cpu_only=False, stack=True)
-        queue[-1]['img_metas'] = DC(metas_map, cpu_only=True)
-        queue = queue[-1]
+                              cpu_only=False, stack=True) # (3, 6, 3, 736, 1280)
+        queue[-1]['img_metas'] = DC(metas_map, cpu_only=True) # 3帧的img_metas以index作为key
+        # 重新赋值新的queue
+        queue = queue[-1] # img_meats(3帧), gt_bboxes_3d, gt_labels_3d, img(3帧)
         return queue
 
     def get_data_info(self, index):
@@ -123,17 +125,17 @@ class CustomNuScenesDataset(NuScenesDataset):
         info = self.data_infos[index]
         # standard protocal modified from SECOND.Pytorch
         input_dict = dict(
-            sample_idx=info['token'],
-            pts_filename=info['lidar_path'],
-            sweeps=info['sweeps'],
-            ego2global_translation=info['ego2global_translation'],
-            ego2global_rotation=info['ego2global_rotation'],
-            prev_idx=info['prev'],
-            next_idx=info['next'],
-            scene_token=info['scene_token'],
-            can_bus=info['can_bus'],
-            frame_idx=info['frame_idx'],
-            timestamp=info['timestamp'] / 1e6,
+            sample_idx=info['token'], # 当前帧的token
+            pts_filename=info['lidar_path'], # lidar的路径
+            sweeps=info['sweeps'], # 过渡帧的info
+            ego2global_translation=info['ego2global_translation'], # ego到global的平移
+            ego2global_rotation=info['ego2global_rotation'], # ego到global的旋转
+            prev_idx=info['prev'], # 前一帧的token
+            next_idx=info['next'], # 下一帧的token
+            scene_token=info['scene_token'], # 场景token
+            can_bus=info['can_bus'], # can bus信息 (18,) [pos, rotation, accel, rotation_rate, vel, 0, 0]
+            frame_idx=info['frame_idx'], # 帧id
+            timestamp=info['timestamp'] / 1e6, # 时间戳
         )
 
         if self.modality['use_camera']:
@@ -146,41 +148,43 @@ class CustomNuScenesDataset(NuScenesDataset):
                 # obtain lidar to image transformation matrix
                 lidar2cam_r = np.linalg.inv(cam_info['sensor2lidar_rotation'])
                 lidar2cam_t = cam_info[
-                    'sensor2lidar_translation'] @ lidar2cam_r.T
+                    'sensor2lidar_translation'] @ lidar2cam_r.T # 右乘
                 lidar2cam_rt = np.eye(4)
-                lidar2cam_rt[:3, :3] = lidar2cam_r.T
+                # 右乘推导
+                lidar2cam_rt[:3, :3] = lidar2cam_r.T # P_l = P_c * (R_l_c)^(T) - t_l_c * (R_l_c)^(T)
                 lidar2cam_rt[3, :3] = -lidar2cam_t
-                intrinsic = cam_info['cam_intrinsic']
+                # 相机内参
+                intrinsic = cam_info['cam_intrinsic'] 
                 viewpad = np.eye(4)
                 viewpad[:intrinsic.shape[0], :intrinsic.shape[1]] = intrinsic
-                lidar2img_rt = (viewpad @ lidar2cam_rt.T)
+                lidar2img_rt = (viewpad @ lidar2cam_rt.T) # 左乘，所以要乘转置
                 lidar2img_rts.append(lidar2img_rt)
 
                 cam_intrinsics.append(viewpad)
-                lidar2cam_rts.append(lidar2cam_rt.T)
+                lidar2cam_rts.append(lidar2cam_rt.T) # 左乘-->lidar到camera图像平面的投影矩阵
 
             input_dict.update(
                 dict(
                     img_filename=image_paths,
-                    lidar2img=lidar2img_rts,
-                    cam_intrinsic=cam_intrinsics,
-                    lidar2cam=lidar2cam_rts,
+                    lidar2img=lidar2img_rts, # lidar到img的投影矩阵
+                    cam_intrinsic=cam_intrinsics, # 相机内参
+                    lidar2cam=lidar2cam_rts, # lidar到cam的投影矩阵
                 ))
 
         if not self.test_mode:
-            annos = self.get_ann_info(index)
-            input_dict['ann_info'] = annos
+            annos = self.get_ann_info(index) # 标注信息
+            input_dict['ann_info'] = annos # 记录标准信息
 
-        rotation = Quaternion(input_dict['ego2global_rotation'])
-        translation = input_dict['ego2global_translation']
-        can_bus = input_dict['can_bus']
+        rotation = Quaternion(input_dict['ego2global_rotation']) # 自车到全局的旋转
+        translation = input_dict['ego2global_translation'] # 自车到全局的平移
+        can_bus = input_dict['can_bus'] # can bus信息 (18,) [pos, rotation, accel, rotation_rate, vel, 0, 0]
         can_bus[:3] = translation
         can_bus[3:7] = rotation
-        patch_angle = quaternion_yaw(rotation) / np.pi * 180
+        patch_angle = quaternion_yaw(rotation) / np.pi * 180 # 计算yaw角
         if patch_angle < 0:
-            patch_angle += 360
-        can_bus[-2] = patch_angle / 180 * np.pi
-        can_bus[-1] = patch_angle
+            patch_angle += 360 # 以x轴为起点，逆时针为正
+        can_bus[-2] = patch_angle / 180 * np.pi # 弧度
+        can_bus[-1] = patch_angle # 角度
 
         return input_dict
 

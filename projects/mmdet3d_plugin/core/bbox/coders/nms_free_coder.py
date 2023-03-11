@@ -26,12 +26,12 @@ class NMSFreeCoder(BaseBBoxCoder):
                  max_num=100,
                  score_threshold=None,
                  num_classes=10):
-        self.pc_range = pc_range
-        self.voxel_size = voxel_size
-        self.post_center_range = post_center_range
-        self.max_num = max_num
-        self.score_threshold = score_threshold
-        self.num_classes = num_classes
+        self.pc_range = pc_range # [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+        self.voxel_size = voxel_size # [0.2, 0.2, 8]
+        self.post_center_range = post_center_range # [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0]
+        self.max_num = max_num # 300
+        self.score_threshold = score_threshold # None
+        self.num_classes = num_classes # 10
 
     def encode(self):
 
@@ -49,17 +49,17 @@ class NMSFreeCoder(BaseBBoxCoder):
         Returns:
             list[dict]: Decoded boxes.
         """
-        max_num = self.max_num
+        max_num = self.max_num # 300
 
-        cls_scores = cls_scores.sigmoid()
-        scores, indexs = cls_scores.view(-1).topk(max_num)
-        labels = indexs % self.num_classes
-        bbox_index = indexs // self.num_classes
-        bbox_preds = bbox_preds[bbox_index]
+        cls_scores = cls_scores.sigmoid() # (900, 10)
+        scores, indexs = cls_scores.view(-1).topk(max_num) # 取前300个
+        labels = indexs % self.num_classes # 计算lables (300,)
+        bbox_index = indexs // self.num_classes # 计算bbox的索引 (300,)
+        bbox_preds = bbox_preds[bbox_index] # 提取预测的bbox (300, 10)
        
-        final_box_preds = denormalize_bbox(bbox_preds, self.pc_range)   
-        final_scores = scores 
-        final_preds = labels 
+        final_box_preds = denormalize_bbox(bbox_preds, self.pc_range) # (300, 9) 
+        final_scores = scores # (300,)
+        final_preds = labels # (300,)
 
         # use score threshold
         if self.score_threshold is not None:
@@ -83,10 +83,10 @@ class NMSFreeCoder(BaseBBoxCoder):
             if self.score_threshold:
                 mask &= thresh_mask
 
-            boxes3d = final_box_preds[mask]
-            scores = final_scores[mask]
+            boxes3d = final_box_preds[mask] # (300, 9)
+            scores = final_scores[mask] # (300,)
 
-            labels = final_preds[mask]
+            labels = final_preds[mask] # (300,)
             predictions_dict = {
                 'bboxes': boxes3d,
                 'scores': scores,
@@ -111,11 +111,12 @@ class NMSFreeCoder(BaseBBoxCoder):
         Returns:
             list[dict]: Decoded boxes.
         """
-        all_cls_scores = preds_dicts['all_cls_scores'][-1]
-        all_bbox_preds = preds_dicts['all_bbox_preds'][-1]
+        all_cls_scores = preds_dicts['all_cls_scores'][-1] # (1, 900, 10) 1:batch size
+        all_bbox_preds = preds_dicts['all_bbox_preds'][-1] # (1, 900, 10)
         
-        batch_size = all_cls_scores.size()[0]
+        batch_size = all_cls_scores.size()[0] # 1
         predictions_list = []
+        # 逐帧decode
         for i in range(batch_size):
             predictions_list.append(self.decode_single(all_cls_scores[i], all_bbox_preds[i]))
         return predictions_list

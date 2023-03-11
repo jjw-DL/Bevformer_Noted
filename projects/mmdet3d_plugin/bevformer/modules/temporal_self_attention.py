@@ -68,10 +68,10 @@ class TemporalSelfAttention(BaseModule):
             raise ValueError(f'embed_dims must be divisible by num_heads, '
                              f'but got {embed_dims} and {num_heads}')
         dim_per_head = embed_dims // num_heads
-        self.norm_cfg = norm_cfg
-        self.dropout = nn.Dropout(dropout)
-        self.batch_first = batch_first
-        self.fp16_enabled = False
+        self.norm_cfg = norm_cfg # None
+        self.dropout = nn.Dropout(dropout) # 0.1
+        self.batch_first = batch_first # True
+        self.fp16_enabled = False # False
 
         # you'd better set dim_per_head to a power of 2
         # which is more efficient in the CUDA implementation
@@ -89,39 +89,40 @@ class TemporalSelfAttention(BaseModule):
                 'the dimension of each attention head a power of 2 '
                 'which is more efficient in our CUDA implementation.')
 
-        self.im2col_step = im2col_step
-        self.embed_dims = embed_dims
-        self.num_levels = num_levels
-        self.num_heads = num_heads
-        self.num_points = num_points
-        self.num_bev_queue = num_bev_queue
+        self.im2col_step = im2col_step # 64
+        self.embed_dims = embed_dims # 256
+        self.num_levels = num_levels # 1
+        self.num_heads = num_heads # 8
+        self.num_points = num_points # 4
+        self.num_bev_queue = num_bev_queue # 2
         self.sampling_offsets = nn.Linear(
-            embed_dims*self.num_bev_queue, num_bev_queue*num_heads * num_levels * num_points * 2)
+            embed_dims*self.num_bev_queue, num_bev_queue*num_heads * num_levels * num_points * 2) # 512-->128 = 2 * 8 * 1 * 4 * 2
         self.attention_weights = nn.Linear(embed_dims*self.num_bev_queue,
-                                           num_bev_queue*num_heads * num_levels * num_points)
-        self.value_proj = nn.Linear(embed_dims, embed_dims)
-        self.output_proj = nn.Linear(embed_dims, embed_dims)
+                                           num_bev_queue*num_heads * num_levels * num_points) # 512-->64 = 2 * 8 * 1 * 4
+        self.value_proj = nn.Linear(embed_dims, embed_dims) # 256-->256
+        self.output_proj = nn.Linear(embed_dims, embed_dims) # 256-->256
         self.init_weights()
 
     def init_weights(self):
         """Default initialization for Parameters of Module."""
-        constant_init(self.sampling_offsets, 0.)
+        constant_init(self.sampling_offsets, 0.) # 采样点的权重初始化
         thetas = torch.arange(
             self.num_heads,
-            dtype=torch.float32) * (2.0 * math.pi / self.num_heads)
-        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
+            dtype=torch.float32) * (2.0 * math.pi / self.num_heads) # 将2pi均分8份
+        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1) # 对角度取cos和sin，并拼接 (8, 2), 一个圆上的点
+        # [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
         grid_init = (grid_init /
                      grid_init.abs().max(-1, keepdim=True)[0]).view(
             self.num_heads, 1, 1,
-            2).repeat(1, self.num_levels*self.num_bev_queue, self.num_points, 1)
+            2).repeat(1, self.num_levels*self.num_bev_queue, self.num_points, 1) # (8, 2)-->(8, 1, 1, 2)-->(8, 2, 4, 2)
 
         for i in range(self.num_points):
-            grid_init[:, :, i, :] *= i + 1
+            grid_init[:, :, i, :] *= i + 1 # 在点的维度上乘索引
 
-        self.sampling_offsets.bias.data = grid_init.view(-1)
-        constant_init(self.attention_weights, val=0., bias=0.)
-        xavier_init(self.value_proj, distribution='uniform', bias=0.)
-        xavier_init(self.output_proj, distribution='uniform', bias=0.)
+        self.sampling_offsets.bias.data = grid_init.view(-1) # 采样点的bias初始化
+        constant_init(self.attention_weights, val=0., bias=0.) # attention权重全0初始化 
+        xavier_init(self.value_proj, distribution='uniform', bias=0.) # 值权重初始化
+        xavier_init(self.output_proj, distribution='uniform', bias=0.) # 值权重初始化
         self._is_init = True
 
     def forward(self,
@@ -173,33 +174,35 @@ class TemporalSelfAttention(BaseModule):
         """
 
         if value is None:
-            value = torch.cat([query, query], 0)
+            value = torch.cat([query, query], 0) # (2, 22500, 256)
 
         if identity is None:
-            identity = query
+            identity = query # (1, 22500, 256)
         if query_pos is not None:
-            query = query + query_pos
+            query = query + query_pos #  # (1, 22500, 256)
         if not self.batch_first:
-            # change to (bs, num_query ,embed_dims)
+            # change to (bs, num_query, embed_dims)
             query = query.permute(1, 0, 2)
             value = value.permute(1, 0, 2)
-        bs,  num_query, _ = query.shape
-        _, num_value, _ = value.shape
+        bs,  num_query, _ = query.shape # (1, 22500, 256)
+        _, num_value, _ = value.shape # (2, 22500, 256)
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
         assert self.num_bev_queue == 2
 
-        query = torch.cat([value[:bs], query], -1)
-        value = self.value_proj(value)
+        query = torch.cat([value[:bs], query], -1) # (1, 22500, 512) 在特征维度拼接当前帧和前一帧的query
+        value = self.value_proj(value) # (2, 22500, 256) T-1帧和T帧的BEV拼接
 
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
 
         value = value.reshape(self.num_bev_queue*bs,
-                              num_value, self.num_heads, -1)
+                              num_value, self.num_heads, -1) # (2, 22500, 8, 32)
 
-        sampling_offsets = self.sampling_offsets(query)
+        sampling_offsets = self.sampling_offsets(query) # (1, 22500, 128)
+        # (1, 22500, 8, 2, 1, 4, 2)
         sampling_offsets = sampling_offsets.view(
             bs, num_query, self.num_heads,  self.num_bev_queue, self.num_levels, self.num_points, 2)
+        # (1, 22500, 8, 2, 4)
         attention_weights = self.attention_weights(query).view(
             bs, num_query,  self.num_heads, self.num_bev_queue, self.num_levels * self.num_points)
         attention_weights = attention_weights.softmax(-1)
@@ -208,19 +211,21 @@ class TemporalSelfAttention(BaseModule):
                                                    self.num_heads,
                                                    self.num_bev_queue,
                                                    self.num_levels,
-                                                   self.num_points)
-
+                                                   self.num_points) # (1, 22500, 8, 2, 1, 4)
+        # (1, 22500, 8, 2, 1, 4)-->(2, 1, 22500, 8, 1, 4)-->(2, 22500, 8, 1, 4)
         attention_weights = attention_weights.permute(3, 0, 1, 2, 4, 5)\
             .reshape(bs*self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points).contiguous()
+        # (2, 1, 22500, 8, 1, 4, 2)-->(2, 22500. 8, 1, 4, 2)
         sampling_offsets = sampling_offsets.permute(3, 0, 1, 2, 4, 5, 6)\
             .reshape(bs*self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points, 2)
 
-        if reference_points.shape[-1] == 2:
+        if reference_points.shape[-1] == 2: # (2, 22500, 1, 2)
             offset_normalizer = torch.stack(
-                [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+                [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1) # [[150, 150]]
+            # (2, 22500, 1, 2)-->(2, 22500, 1, 1, 1, 2) + (2, 22500, 8, 1, 4, 2) / (1, 1, 1, 1, 1, 2)
             sampling_locations = reference_points[:, :, None, :, None, :] \
                 + sampling_offsets \
-                / offset_normalizer[None, None, None, :, None, :]
+                / offset_normalizer[None, None, None, :, None, :] # (2, 22500, 8, 1, 4, 2)
 
         elif reference_points.shape[-1] == 4:
             sampling_locations = reference_points[:, :, None, :, None, :2] \
@@ -240,24 +245,25 @@ class TemporalSelfAttention(BaseModule):
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
-                attention_weights, self.im2col_step)
+                attention_weights, self.im2col_step) # (2, 22500, 256) 该query在T-1和T帧的产生的新query
         else:
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)
-        # output shape (bs*num_bev_queue, num_query, embed_dims)
+        # output shape (bs*num_bev_queue, num_query, embed_dims) --> (2, 22500, 256)
         # (bs*num_bev_queue, num_query, embed_dims)-> (num_query, embed_dims, bs*num_bev_queue)
-        output = output.permute(1, 2, 0)
+        output = output.permute(1, 2, 0) # (22500, 256, 2)
 
         # fuse history value and current value
         # (num_query, embed_dims, bs*num_bev_queue)-> (num_query, embed_dims, bs)
-        output = (output[..., :bs] + output[..., bs:])/self.num_bev_queue
+        # (22500, 256, 1) + (22500, 256, 1) --> (22500, 256, 1)
+        output = (output[..., :bs] + output[..., bs:])/self.num_bev_queue # (22500, 256, 1) 取平均值
 
         # (num_query, embed_dims, bs)-> (bs, num_query, embed_dims)
-        output = output.permute(2, 0, 1)
+        output = output.permute(2, 0, 1) # (1, 22500, 256) T帧的新BEV query
 
-        output = self.output_proj(output)
+        output = self.output_proj(output) # (1, 22500, 256)
 
         if not self.batch_first:
             output = output.permute(1, 0, 2)
 
-        return self.dropout(output) + identity
+        return self.dropout(output) + identity # (1, 22500, 256)

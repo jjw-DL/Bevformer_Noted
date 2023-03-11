@@ -46,10 +46,10 @@ def create_nuscenes_infos(root_path,
             Default: 10
     """
     from nuscenes.nuscenes import NuScenes
-    from nuscenes.can_bus.can_bus_api import NuScenesCanBus
+    from nuscenes.can_bus.can_bus_api import NuScenesCanBus # 引入了CAN Bus模块
     print(version, root_path)
     nusc = NuScenes(version=version, dataroot=root_path, verbose=True)
-    nusc_can_bus = NuScenesCanBus(dataroot=can_bus_root_path)
+    nusc_can_bus = NuScenesCanBus(dataroot=can_bus_root_path) # 初始化 CAN Bus
     from nuscenes.utils import splits
     available_vers = ['v1.0-trainval', 'v1.0-test', 'v1.0-mini']
     assert version in available_vers
@@ -88,7 +88,7 @@ def create_nuscenes_infos(root_path,
             len(train_scenes), len(val_scenes)))
 
     train_nusc_infos, val_nusc_infos = _fill_trainval_infos(
-        nusc, nusc_can_bus, train_scenes, val_scenes, test, max_sweeps=max_sweeps)
+        nusc, nusc_can_bus, train_scenes, val_scenes, test, max_sweeps=max_sweeps) # 传入can bus
 
     metadata = dict(version=version)
     if test:
@@ -152,12 +152,14 @@ def get_available_scenes(nusc):
 
 
 def _get_can_bus_info(nusc, nusc_can_bus, sample):
-    scene_name = nusc.get('scene', sample['scene_token'])['name']
-    sample_timestamp = sample['timestamp']
+    scene_name = nusc.get('scene', sample['scene_token'])['name'] # 获取场景name eg:scene-0001
+    sample_timestamp = sample['timestamp'] # 获取该sample的时间戳 eg:15318835304479377
     try:
-        pose_list = nusc_can_bus.get_messages(scene_name, 'pose')
+        # 通过场景名称获取pose list eg:(964,)
+        # 包含accel(3), orientation(4), pos(3), rotation_rate(3), utime(1), vel(3) 共17个元素
+        pose_list = nusc_can_bus.get_messages(scene_name, 'pose') 
     except:
-        return np.zeros(18)  # server scenes do not have can bus information.
+        return np.zeros(18)  # server scenes do not have can bus information. # 没有提供pose信息的返回全0
     can_bus = []
     # during each scene, the first timestamp of can_bus may be large than the first sample's timestamp
     last_pose = pose_list[0]
@@ -166,13 +168,13 @@ def _get_can_bus_info(nusc, nusc_can_bus, sample):
             break
         last_pose = pose
     _ = last_pose.pop('utime')  # useless
-    pos = last_pose.pop('pos')
-    rotation = last_pose.pop('orientation')
-    can_bus.extend(pos)
-    can_bus.extend(rotation)
-    for key in last_pose.keys():
+    pos = last_pose.pop('pos') # eg:(1010.1436, 610.888, 0)
+    rotation = last_pose.pop('orientation') # eg:(0.7479, 0.0, 0.0, 0.6637)
+    can_bus.extend(pos) # 将position加入can_bus的list
+    can_bus.extend(rotation) # 将rotation四元数加入can_bus的list
+    for key in last_pose.keys(): # [accel, rotation_rate, vel]
         can_bus.extend(pose[key])  # 16 elements
-    can_bus.extend([0., 0.])
+    can_bus.extend([0., 0.]) # 扩展2个元素
     return np.array(can_bus)
 
 
@@ -198,7 +200,7 @@ def _fill_trainval_infos(nusc,
     """
     train_nusc_infos = []
     val_nusc_infos = []
-    frame_idx = 0
+    frame_idx = 0 # 初始化frame id
     for sample in mmcv.track_iter_progress(nusc.sample):
         lidar_token = sample['data']['LIDAR_TOP']
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
@@ -208,14 +210,14 @@ def _fill_trainval_infos(nusc,
         lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
 
         mmcv.check_file_exist(lidar_path)
-        can_bus = _get_can_bus_info(nusc, nusc_can_bus, sample)
-        ##
+        can_bus = _get_can_bus_info(nusc, nusc_can_bus, sample) # 获取该sample对应的can bus信息
+        # 增加了prev，next，can_bus，frame_idx和scene_token字段
         info = {
             'lidar_path': lidar_path,
             'token': sample['token'],
-            'prev': sample['prev'],
-            'next': sample['next'],
-            'can_bus': can_bus,
+            'prev': sample['prev'], # 前一帧的token，是否是关键帧？
+            'next': sample['next'], # 后一帧的token
+            'can_bus': can_bus, # can bus信息 (18,) [pos, rotation, accel, rotation_rate, vel, 0, 0]
             'frame_idx': frame_idx,  # temporal related info
             'sweeps': [],
             'cams': dict(),

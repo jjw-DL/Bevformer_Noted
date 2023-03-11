@@ -33,7 +33,7 @@ except ImportError:
                   'You should install ``mmcv-full`` if you need this module. ')
 from mmcv.cnn.bricks.transformer import build_feedforward_network, build_attention
 
-
+# mmcv.cnn.bricks.BaseTransformerLayer
 @TRANSFORMER_LAYER.register_module()
 class MyCustomBaseTransformerLayer(BaseModule):
     """Base `TransformerLayer` for vision transformer.
@@ -70,16 +70,16 @@ class MyCustomBaseTransformerLayer(BaseModule):
     """
 
     def __init__(self,
-                 attn_cfgs=None,
+                 attn_cfgs=None, # MultiheadAttention
                  ffn_cfgs=dict(
                      type='FFN',
                      embed_dims=256,
-                     feedforward_channels=1024,
+                     feedforward_channels=1024, # 2048
                      num_fcs=2,
-                     ffn_drop=0.,
+                     ffn_drop=0., # 0.1
                      act_cfg=dict(type='ReLU', inplace=True),
                  ),
-                 operation_order=None,
+                 operation_order=None, # ('self_attn', 'norm', 'ffn', 'norm')
                  norm_cfg=dict(type='LN'),
                  init_cfg=None,
                  batch_first=True,
@@ -96,11 +96,11 @@ class MyCustomBaseTransformerLayer(BaseModule):
                     f'has been deprecated, now you should set `{new_name}` '
                     f'and other FFN related arguments '
                     f'to a dict named `ffn_cfgs`. ')
-                ffn_cfgs[new_name] = kwargs[ori_name]
+                ffn_cfgs[new_name] = kwargs[ori_name] # 将旧版的FFN参数重新赋值到对应位置
 
         super(MyCustomBaseTransformerLayer, self).__init__(init_cfg)
 
-        self.batch_first = batch_first
+        self.batch_first = batch_first # False
 
         assert set(operation_order) & set(
             ['self_attn', 'norm', 'ffn', 'cross_attn']) == \
@@ -110,21 +110,24 @@ class MyCustomBaseTransformerLayer(BaseModule):
             f"{['self_attn', 'norm', 'ffn', 'cross_attn']}"
 
         num_attn = operation_order.count('self_attn') + operation_order.count(
-            'cross_attn')
+            'cross_attn') # 2
         if isinstance(attn_cfgs, dict):
-            attn_cfgs = [copy.deepcopy(attn_cfgs) for _ in range(num_attn)]
+            attn_cfgs = [copy.deepcopy(attn_cfgs) for _ in range(num_attn)] # 根据num_attn复制attn_cfg配置
         else:
             assert num_attn == len(attn_cfgs), f'The length ' \
                 f'of attn_cfg {num_attn} is ' \
                 f'not consistent with the number of attention' \
                 f'in operation_order {operation_order}.'
 
-        self.num_attn = num_attn
-        self.operation_order = operation_order
-        self.norm_cfg = norm_cfg
-        self.pre_norm = operation_order[0] == 'norm'
-        self.attentions = ModuleList()
+        self.num_attn = num_attn # 1
+        self.operation_order = operation_order # {'self_attn', 'norm', 'cross_attn', 'norm', 'ffn', 'norm'}
+        self.norm_cfg = norm_cfg # dict(tpye='LN')
+        self.pre_norm = operation_order[0] == 'norm' # False
+        self.attentions = ModuleList() # 初始化attn
 
+        ####################################################
+        # 逐个构建attention模块(包括self_attn和cross_attn)
+        ####################################################
         index = 0
         for operation_name in operation_order:
             if operation_name in ['self_attn', 'cross_attn']:
@@ -139,12 +142,15 @@ class MyCustomBaseTransformerLayer(BaseModule):
                 self.attentions.append(attention)
                 index += 1
 
-        self.embed_dims = self.attentions[0].embed_dims
+        self.embed_dims = self.attentions[0].embed_dims # 获取attention的嵌入维度 256
 
+        ##########################
+        # 初始化FFN
+        ##########################
         self.ffns = ModuleList()
-        num_ffns = operation_order.count('ffn')
+        num_ffns = operation_order.count('ffn') # 1
         if isinstance(ffn_cfgs, dict):
-            ffn_cfgs = ConfigDict(ffn_cfgs)
+            ffn_cfgs = ConfigDict(ffn_cfgs) # 构造mmcv.ConfigDictlie
         if isinstance(ffn_cfgs, dict):
             ffn_cfgs = [copy.deepcopy(ffn_cfgs) for _ in range(num_ffns)]
         assert len(ffn_cfgs) == num_ffns
@@ -155,12 +161,15 @@ class MyCustomBaseTransformerLayer(BaseModule):
                 assert ffn_cfgs[ffn_index]['embed_dims'] == self.embed_dims
 
             self.ffns.append(
-                build_feedforward_network(ffn_cfgs[ffn_index]))
+                build_feedforward_network(ffn_cfgs[ffn_index])) # 根据num_ffn层构建ffns层
 
+        ##########################
+        # 初始化Norm
+        ##########################
         self.norms = ModuleList()
         num_norms = operation_order.count('norm')
         for _ in range(num_norms):
-            self.norms.append(build_norm_layer(norm_cfg, self.embed_dims)[1])
+            self.norms.append(build_norm_layer(norm_cfg, self.embed_dims)[1]) # 根据num_norms构建Norm层
 
     def forward(self,
                 query,
@@ -199,13 +208,13 @@ class MyCustomBaseTransformerLayer(BaseModule):
         Returns:
             Tensor: forwarded results with shape [num_queries, bs, embed_dims].
         """
-
+        # 初始化index和identity
         norm_index = 0
         attn_index = 0
         ffn_index = 0
         identity = query
         if attn_masks is None:
-            attn_masks = [None for _ in range(self.num_attn)]
+            attn_masks = [None for _ in range(self.num_attn)] # [None, None]
         elif isinstance(attn_masks, torch.Tensor):
             attn_masks = [
                 copy.deepcopy(attn_masks) for _ in range(self.num_attn)
@@ -217,7 +226,7 @@ class MyCustomBaseTransformerLayer(BaseModule):
                 f'attn_masks {len(attn_masks)} must be equal ' \
                 f'to the number of attention in ' \
                 f'operation_order {self.num_attn}'
-
+        # 按照operation_order逐个模块处理
         for layer in self.operation_order:
             if layer == 'self_attn':
                 temp_key = temp_value = query

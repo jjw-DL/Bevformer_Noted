@@ -57,15 +57,15 @@ class SpatialCrossAttention(BaseModule):
                  ):
         super(SpatialCrossAttention, self).__init__(init_cfg)
 
-        self.init_cfg = init_cfg
-        self.dropout = nn.Dropout(dropout)
-        self.pc_range = pc_range
+        self.init_cfg = init_cfg # None
+        self.dropout = nn.Dropout(dropout) # 0.1
+        self.pc_range = pc_range # [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
         self.fp16_enabled = False
-        self.deformable_attention = build_attention(deformable_attention)
-        self.embed_dims = embed_dims
-        self.num_cams = num_cams
-        self.output_proj = nn.Linear(embed_dims, embed_dims)
-        self.batch_first = batch_first
+        self.deformable_attention = build_attention(deformable_attention) # MSDeformableAttention3D
+        self.embed_dims = embed_dims # 256
+        self.num_cams = num_cams # 6
+        self.output_proj = nn.Linear(embed_dims, embed_dims) # 256-->256
+        self.batch_first = batch_first # True
         self.init_weight()
 
     def init_weight(self):
@@ -126,57 +126,70 @@ class SpatialCrossAttention(BaseModule):
             value = key
 
         if residual is None:
-            inp_residual = query
-            slots = torch.zeros_like(query)
+            inp_residual = query # (1, 22500, 256)
+            slots = torch.zeros_like(query) # (1, 22500, 256)
         if query_pos is not None:
-            query = query + query_pos
+            query = query + query_pos # (1, 22500, 256)
 
-        bs, num_query, _ = query.size()
+        bs, num_query, _ = query.size() # 1, 22500, 256
 
-        D = reference_points_cam.size(3)
+        D = reference_points_cam.size(3) # 4
         indexes = []
-        for i, mask_per_img in enumerate(bev_mask):
+        for i, mask_per_img in enumerate(bev_mask): # bev_mask:(6, 1, 22500, 4)
+            # (1, 22500, 4)-->(22500, 4)-->(22500,)-->(3546, 1)-->(3546,) 在该图片投影中的有效query index
             index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
-            indexes.append(index_query_per_img)
-        max_len = max([len(each) for each in indexes])
+            indexes.append(index_query_per_img) # 将有效query index加入list
+        max_len = max([len(each) for each in indexes]) # eg:5439 最大的有效query长度
 
-        # each camera only interacts with its corresponding BEV queries. This step can  greatly save GPU memory.
+        # each camera only interacts with its corresponding BEV queries. This step can greatly save GPU memory.
         queries_rebatch = query.new_zeros(
-            [bs * self.num_cams, max_len, self.embed_dims])
+            [bs * self.num_cams, max_len, self.embed_dims]) # (6, 5439, 256)
         reference_points_rebatch = reference_points_cam.new_zeros(
-            [bs * self.num_cams, max_len, D, 2])
+            [bs * self.num_cams, max_len, D, 2]) # (6, 5439, 4, 2)
 
-        for i, reference_points_per_img in enumerate(reference_points_cam):
+        # 逐帧处理
+        for i, reference_points_per_img in enumerate(reference_points_cam): # (6, 1, 22500, 4, 2)
             for j in range(bs):
-                index_query_per_img = indexes[i]
+                index_query_per_img = indexes[i] # eg:3546
+                # query:(1, 22500, 256)
                 queries_rebatch[j * self.num_cams + i,
-                                :len(index_query_per_img)] = query[j, index_query_per_img]
+                                :len(index_query_per_img)] = query[j, index_query_per_img] # 提取有效query
                 reference_points_rebatch[j * self.num_cams + i, :len(index_query_per_img)] = reference_points_per_img[j,
-                                                                                                                      index_query_per_img]
+                                                                                                                      index_query_per_img] # 提取有效投影点
 
-        num_cams, l, bs, embed_dims = key.shape
+        num_cams, l, bs, embed_dims = key.shape # 6, 920, 1, 256
 
+        # (6, 920, 1, 256)-->(6, 1, 920, 256)-->(6, 920, 256)
         key = key.permute(0, 2, 1, 3).view(
-            self.num_cams * bs, l, self.embed_dims)
+            self.num_cams * bs, l, self.embed_dims) 
+        # (6, 920, 1, 256)-->(6, 1, 920, 256)-->(6, 920, 256)
         value = value.permute(0, 2, 1, 3).view(
             self.num_cams * bs, l, self.embed_dims)
-
+        """
+        queries_rebatch:(6, 5439, 256)
+        key:(6, 920, 256)
+        value:(6, 920, 256)
+        reference_points_rebatch:(6, 5439, 4, 2)
+        spatial_shapes:[[23, 40]]
+        level_start_index:[0]
+        """
         queries = self.deformable_attention(query=queries_rebatch, key=key, value=value,
                                             reference_points=reference_points_rebatch, spatial_shapes=spatial_shapes,
-                                            level_start_index=level_start_index)
+                                            level_start_index=level_start_index) # (6, 5439, 256)
 
         for i, index_query_per_img in enumerate(indexes):
             for j in range(bs):
+                # 提取有效query赋值到对应位置
                 slots[j, index_query_per_img] += queries[j *
-                                                         self.num_cams + i, :len(index_query_per_img)]
+                                                         self.num_cams + i, :len(index_query_per_img)] # (1, 22500, 256)
 
-        count = bev_mask.sum(-1) > 0
-        count = count.permute(1, 2, 0).sum(-1)
-        count = torch.clamp(count, min=1.0)
-        slots = slots / count[..., None]
-        slots = self.output_proj(slots)
+        count = bev_mask.sum(-1) > 0 # (6, 1, 22500, 4)-->(6, 1, 22500) 在高度维度上求和，因为不同高度对应的是同一个query
+        count = count.permute(1, 2, 0).sum(-1) # (6, 1, 22500) --> (1, 22500, 6) --> (1, 22500) 相机维度求和，将通一个query在不同相机的投影点求和
+        count = torch.clamp(count, min=1.0) # (1, 22500)
+        slots = slots / count[..., None] # (1, 22500, 256) / (1, 22500, 1) 取均值
+        slots = self.output_proj(slots) # (1, 22500, 256)
 
-        return self.dropout(slots) + inp_residual
+        return self.dropout(slots) + inp_residual # (1, 22500, 256)
 
 
 @ATTENTION.register_module()
@@ -221,7 +234,7 @@ class MSDeformableAttention3D(BaseModule):
                              f'but got {embed_dims} and {num_heads}')
         dim_per_head = embed_dims // num_heads
         self.norm_cfg = norm_cfg
-        self.batch_first = batch_first
+        self.batch_first = batch_first # True
         self.output_proj = None
         self.fp16_enabled = False
 
@@ -241,16 +254,16 @@ class MSDeformableAttention3D(BaseModule):
                 'the dimension of each attention head a power of 2 '
                 'which is more efficient in our CUDA implementation.')
 
-        self.im2col_step = im2col_step
-        self.embed_dims = embed_dims
-        self.num_levels = num_levels
-        self.num_heads = num_heads
-        self.num_points = num_points
+        self.im2col_step = im2col_step # 64
+        self.embed_dims = embed_dims # 256
+        self.num_levels = num_levels # 1
+        self.num_heads = num_heads # 8
+        self.num_points = num_points # 4
         self.sampling_offsets = nn.Linear(
-            embed_dims, num_heads * num_levels * num_points * 2)
+            embed_dims, num_heads * num_levels * num_points * 2) # 256-->64
         self.attention_weights = nn.Linear(embed_dims,
-                                           num_heads * num_levels * num_points)
-        self.value_proj = nn.Linear(embed_dims, embed_dims)
+                                           num_heads * num_levels * num_points) # 256-->64
+        self.value_proj = nn.Linear(embed_dims, embed_dims) # 256-->256
 
         self.init_weights()
 
@@ -322,36 +335,38 @@ class MSDeformableAttention3D(BaseModule):
         if value is None:
             value = query
         if identity is None:
-            identity = query
+            identity = query # (6, 5439, 256)
         if query_pos is not None:
-            query = query + query_pos
+            query = query + query_pos # (6, 5439, 256)
 
         if not self.batch_first:
             # change to (bs, num_query ,embed_dims)
             query = query.permute(1, 0, 2)
             value = value.permute(1, 0, 2)
 
-        bs, num_query, _ = query.shape
-        bs, num_value, _ = value.shape
+        bs, num_query, _ = query.shape # 6, 5439, 256
+        bs, num_value, _ = value.shape # 6, 920, 256
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
-        value = self.value_proj(value)
+        value = self.value_proj(value) # (6, 920, 256)
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
-        value = value.view(bs, num_value, self.num_heads, -1)
+        value = value.view(bs, num_value, self.num_heads, -1) # (6, 920, 8, 32)
+        # (6, 5439, 128) --> (6, 5439, 8, 1, 8, 1)
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+        # (6, 5439, 64) --> (6, 5439, 8, 8)
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
 
-        attention_weights = attention_weights.softmax(-1)
+        attention_weights = attention_weights.softmax(-1) # (6, 5439, 8, 8)
 
         attention_weights = attention_weights.view(bs, num_query,
                                                    self.num_heads,
                                                    self.num_levels,
-                                                   self.num_points)
+                                                   self.num_points) # (6, 5439, 8, 1, 8)
 
-        if reference_points.shape[-1] == 2:
+        if reference_points.shape[-1] == 2: # (6, 5439, 4, 2)
             """
             For each BEV query, it owns `num_Z_anchors` in 3D space that having different heights.
             After proejcting, each BEV query has `num_Z_anchors` reference points in each 2D image.
@@ -359,21 +374,22 @@ class MSDeformableAttention3D(BaseModule):
             For `num_Z_anchors` reference points,  it has overall `num_points * num_Z_anchors` sampling points.
             """
             offset_normalizer = torch.stack(
-                [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+                [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1) # [[40, 23]] (1, 2)
 
-            bs, num_query, num_Z_anchors, xy = reference_points.shape
-            reference_points = reference_points[:, :, None, None, None, :, :]
+            bs, num_query, num_Z_anchors, xy = reference_points.shape # (6, 5439, 4, 2)
+            reference_points = reference_points[:, :, None, None, None, :, :] # (6, 5439, 1, 1, 1, 4, 2)
             sampling_offsets = sampling_offsets / \
-                offset_normalizer[None, None, None, :, None, :]
-            bs, num_query, num_heads, num_levels, num_all_points, xy = sampling_offsets.shape
-            sampling_offsets = sampling_offsets.view(
-                bs, num_query, num_heads, num_levels, num_all_points // num_Z_anchors, num_Z_anchors, xy)
+                offset_normalizer[None, None, None, :, None, :] # (6, 5439, 8, 1, 8, 2) / (1, 1, 1, 1, 1, 2)
+            bs, num_query, num_heads, num_levels, num_all_points, xy = sampling_offsets.shape # 6, 5439, 8, 1, 8, 2
+            sampling_offsets = sampling_offsets.view( # 一个query在不同高度上产生2个偏移量
+                bs, num_query, num_heads, num_levels, num_all_points // num_Z_anchors, num_Z_anchors, xy) # (6, 5439, 8, 1, 2, 4, 2)
+            # (6, 5439, 1, 1, 1, 4, 2) + (6, 5439, 8, 1, 2, 4, 2) --> (6, 5439, 8, 1, 2, 4, 2)
             sampling_locations = reference_points + sampling_offsets
-            bs, num_query, num_heads, num_levels, num_points, num_Z_anchors, xy = sampling_locations.shape
+            bs, num_query, num_heads, num_levels, num_points, num_Z_anchors, xy = sampling_locations.shape # 6, 5439, 8, 1, 2, 4, 2
             assert num_all_points == num_points * num_Z_anchors
 
             sampling_locations = sampling_locations.view(
-                bs, num_query, num_heads, num_levels, num_all_points, xy)
+                bs, num_query, num_heads, num_levels, num_all_points, xy) # (6, 5439, 8, 1, 8, 2) # 合并高度方向参考点
 
         elif reference_points.shape[-1] == 4:
             assert False
@@ -384,7 +400,6 @@ class MSDeformableAttention3D(BaseModule):
 
         #  sampling_locations.shape: bs, num_query, num_heads, num_levels, num_all_points, 2
         #  attention_weights.shape: bs, num_query, num_heads, num_levels, num_all_points
-        #
 
         if torch.cuda.is_available() and value.is_cuda:
             if value.dtype == torch.float16:
@@ -393,11 +408,11 @@ class MSDeformableAttention3D(BaseModule):
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
-                attention_weights, self.im2col_step)
+                attention_weights, self.im2col_step) # (6, 5439, 256)
         else:
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)
         if not self.batch_first:
             output = output.permute(1, 0, 2)
 
-        return output
+        return output # (6, 5439, 256)

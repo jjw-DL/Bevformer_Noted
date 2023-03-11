@@ -60,7 +60,7 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
 
     def __init__(self, *args, return_intermediate=False, **kwargs):
         super(DetectionTransformerDecoder, self).__init__(*args, **kwargs)
-        self.return_intermediate = return_intermediate
+        self.return_intermediate = return_intermediate # True
         self.fp16_enabled = False
 
     def forward(self,
@@ -87,44 +87,47 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
                 return_intermediate is `False`, otherwise it has shape
                 [num_layers, num_query, bs, embed_dims].
         """
-        output = query
+        output = query # (900, 1, 256)
         intermediate = []
         intermediate_reference_points = []
         for lid, layer in enumerate(self.layers):
 
             reference_points_input = reference_points[..., :2].unsqueeze(
-                2)  # BS NUM_QUERY NUM_LEVEL 2
+                2)  # BS NUM_QUERY NUM_LEVEL 2 --> (1, 900, 1, 2)
             output = layer(
-                output,
+                output, # (900, 1, 256)
                 *args,
-                reference_points=reference_points_input,
-                key_padding_mask=key_padding_mask,
-                **kwargs)
-            output = output.permute(1, 0, 2)
+                reference_points=reference_points_input, # (1, 900, 1, 2)
+                key_padding_mask=key_padding_mask, # None
+                **kwargs) # (900, 1, 256)
+            output = output.permute(1, 0, 2) # (900, 1, 256)-->(1, 900, 256)
 
             if reg_branches is not None:
-                tmp = reg_branches[lid](output)
+                tmp = reg_branches[lid](output) # (1, 900, 10)
 
                 assert reference_points.shape[-1] == 3
 
-                new_reference_points = torch.zeros_like(reference_points)
+                new_reference_points = torch.zeros_like(reference_points) # (1, 900, 3)
+                # 在原参考点(真实坐标逆sigmoid)基础上+预测值(偏移量)
                 new_reference_points[..., :2] = tmp[
-                    ..., :2] + inverse_sigmoid(reference_points[..., :2])
+                    ..., :2] + inverse_sigmoid(reference_points[..., :2]) # (1, 900, 2)
+                # 此时新参考点是真实坐标，不是0-1之间
                 new_reference_points[..., 2:3] = tmp[
-                    ..., 4:5] + inverse_sigmoid(reference_points[..., 2:3])
+                    ..., 4:5] + inverse_sigmoid(reference_points[..., 2:3]) # (1, 900, 1)
 
-                new_reference_points = new_reference_points.sigmoid()
+                new_reference_points = new_reference_points.sigmoid() # (1, 900, 3)
 
-                reference_points = new_reference_points.detach()
+                # 参考点的计算不参与反向传播，而且均经过sigmoid，归一化到0～1之间
+                reference_points = new_reference_points.detach() # (1, 900, 3)
 
-            output = output.permute(1, 0, 2)
+            output = output.permute(1, 0, 2) # (900, 1, 256)
             if self.return_intermediate:
-                intermediate.append(output)
-                intermediate_reference_points.append(reference_points)
+                intermediate.append(output) # 记录中间预测值输出 (900, 1, 256)
+                intermediate_reference_points.append(reference_points) # 记录参考点 (900, 1, 3)
 
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(
-                intermediate_reference_points)
+                intermediate_reference_points) # （6, 900 1, 256)和 (6, 1, 900, 3)
 
         return output, reference_points
 
@@ -172,9 +175,9 @@ class CustomMSDeformableAttention(BaseModule):
             raise ValueError(f'embed_dims must be divisible by num_heads, '
                              f'but got {embed_dims} and {num_heads}')
         dim_per_head = embed_dims // num_heads
-        self.norm_cfg = norm_cfg
-        self.dropout = nn.Dropout(dropout)
-        self.batch_first = batch_first
+        self.norm_cfg = norm_cfg # LN
+        self.dropout = nn.Dropout(dropout) # 0.1
+        self.batch_first = batch_first # False
         self.fp16_enabled = False
 
         # you'd better set dim_per_head to a power of 2
@@ -193,17 +196,17 @@ class CustomMSDeformableAttention(BaseModule):
                 'the dimension of each attention head a power of 2 '
                 'which is more efficient in our CUDA implementation.')
 
-        self.im2col_step = im2col_step
-        self.embed_dims = embed_dims
-        self.num_levels = num_levels
-        self.num_heads = num_heads
-        self.num_points = num_points
+        self.im2col_step = im2col_step # 64
+        self.embed_dims = embed_dims # 256
+        self.num_levels = num_levels # 1
+        self.num_heads = num_heads # 8
+        self.num_points = num_points # 4
         self.sampling_offsets = nn.Linear(
-            embed_dims, num_heads * num_levels * num_points * 2)
+            embed_dims, num_heads * num_levels * num_points * 2) # 256-->8 * 1 * 4 * 2 = 64
         self.attention_weights = nn.Linear(embed_dims,
-                                           num_heads * num_levels * num_points)
-        self.value_proj = nn.Linear(embed_dims, embed_dims)
-        self.output_proj = nn.Linear(embed_dims, embed_dims)
+                                           num_heads * num_levels * num_points) # 256-->8 * 1 * 4=32
+        self.value_proj = nn.Linear(embed_dims, embed_dims) # 256-->256
+        self.output_proj = nn.Linear(embed_dims, embed_dims) # 256-->256
         self.init_weights()
 
     def init_weights(self):
@@ -277,39 +280,43 @@ class CustomMSDeformableAttention(BaseModule):
         """
 
         if value is None:
-            value = query
+            value = query # (1, 22500, 256)
 
         if identity is None:
-            identity = query
+            identity = query # (1, 900, 256)
         if query_pos is not None:
-            query = query + query_pos
+            query = query + query_pos # (1, 900, 256)
         if not self.batch_first:
             # change to (bs, num_query ,embed_dims)
             query = query.permute(1, 0, 2)
             value = value.permute(1, 0, 2)
 
-        bs, num_query, _ = query.shape
-        bs, num_value, _ = value.shape
+        bs, num_query, _ = query.shape # (1, 900, _)
+        bs, num_value, _ = value.shape # (1, 22500, _)
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
-        value = self.value_proj(value)
+        value = self.value_proj(value) # (1, 22500, 256)
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
-        value = value.view(bs, num_value, self.num_heads, -1)
+        value = value.view(bs, num_value, self.num_heads, -1) # (1, 22500, 8, 32)
 
+        # (1, 900, 64) --> (1, 900, 8, 1, 4, 2)
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+        # (1, 900, 64) --> (1, 900, 8, 4)
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
-        attention_weights = attention_weights.softmax(-1)
+        attention_weights = attention_weights.softmax(-1) # (1, 900, 8, 4)
 
         attention_weights = attention_weights.view(bs, num_query,
                                                    self.num_heads,
                                                    self.num_levels,
-                                                   self.num_points)
+                                                   self.num_points) # (1, 900, 8, 1, 4)
         if reference_points.shape[-1] == 2:
+            # [[150, 150]] --> (1, 2)
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            # (1, 900, 1, 1, 1, 2) + (1, 900, 8, 1, 4, 2) / (1, 1, 1, 1, 1, 2) --> (1, 900, 8, 1, 4, 2)
             sampling_locations = reference_points[:, :, None, :, None, :] \
                 + sampling_offsets \
                 / offset_normalizer[None, None, None, :, None, :]
@@ -331,15 +338,15 @@ class CustomMSDeformableAttention(BaseModule):
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
-                attention_weights, self.im2col_step)
+                attention_weights, self.im2col_step) # (1, 900, 256)
         else:
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)
 
-        output = self.output_proj(output)
+        output = self.output_proj(output) # (1, 900, 256)
 
         if not self.batch_first:
             # (num_query, bs ,embed_dims)
-            output = output.permute(1, 0, 2)
+            output = output.permute(1, 0, 2) # (900, 1, 256)
 
-        return self.dropout(output) + identity
+        return self.dropout(output) + identity # (900, 1, 256)
